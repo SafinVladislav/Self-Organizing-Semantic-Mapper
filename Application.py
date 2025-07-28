@@ -1,428 +1,596 @@
 import tkinter as tk
-from tkinter import filedialog, scrolledtext, messagebox
+from tkinter import filedialog, scrolledtext, messagebox, ttk
 import os
 import json
 import numpy as np
 import threading
+import hashlib # Import hashlib for creating unique identifiers
+from tkinter import font # Import the font module
+import sys
 
-# It's good practice to wrap third-party imports in a try-except block
-# to provide helpful messages if the library isn't installed.
+# --- Dependency Checks for Document Formats ---
+
+# PDF Support
 try:
     import PyPDF2
 except ImportError:
-    messagebox.showerror(
-        "Missing Library",
-        "The 'PyPDF2' library is not installed.\n"
-        "Please install it using: pip install PyPDF2"
-    )
-    exit() # Exit if essential library is missing
+    messagebox.showerror("Missing Library", "PyPDF2 is not installed (for .pdf files).\nPlease use: pip install PyPDF2")
+    # We don't exit, allowing the app to run and process other formats.
 
+# DOCX Support
+try:
+    import docx
+except ImportError:
+    messagebox.showwarning("Missing Library", "python-docx is not installed.\nProcessing .docx files will not be possible.\nPlease use: pip install python-docx")
+
+# AI & Scientific Computing Support
 try:
     from sentence_transformers import SentenceTransformer
     from sklearn.metrics.pairwise import cosine_similarity
 except ImportError:
-    messagebox.showerror(
-        "Missing Libraries",
-        "The 'sentence-transformers' or 'scikit-learn' libraries are not installed.\n"
-        "Please install them using: pip install sentence-transformers scikit-learn numpy"
-    )
-    exit() # Exit if essential libraries are missing
-
-import nltk # Used for robust text chunking
+    messagebox.showerror("Missing Libraries", "The 'sentence-transformers' or 'scikit-learn' libraries are not installed.\nPlease install them to enable semantic search.\n\nUse: pip install sentence-transformers scikit-learn")
+    sys.exit()
+# NLTK for Text Chunking
+import nltk
+nltk_data_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nltk_data')
+if nltk_data_path not in nltk.data.path:
+    nltk.data.path.append(nltk_data_path)
 try:
+    # Check for English punkt tokenizer (already in original code)
     nltk.data.find('tokenizers/punkt')
 except nltk.downloader.DownloadError:
-    # This block handles the case where 'punkt' tokenizer is not downloaded.
-    # It attempts to download it, which is crucial for the chunking function.
-    messagebox.showinfo(
-        "NLTK Download",
-        "NLTK 'punkt' tokenizer not found. Downloading it now for text processing. "
-        "This is a one-time download."
-    )
-    nltk.download('punkt')
+    messagebox.showinfo("NLTK Download", "Downloading 'punkt' tokenizer (English) for text processing. This is a one-time download.")
+    nltk.data.path.append('./nltk_data')
+    nltk.download('punkt', download_dir='./nltk_data', quiet=True)
 
+try:
+    # --- NEW: Check and download for Russian punkt tokenizer ---
+    nltk.data.find('tokenizers/punkt/russian.pickle')
+except nltk.downloader.DownloadError:
+    messagebox.showinfo("NLTK Download", "Downloading 'punkt' tokenizer (Russian) for text processing. This is a one-time download.")
+    nltk.data.path.append('./nltk_data')
+    nltk.download('punkt', download_dir='./nltk_data', quiet=True) # Use quiet=True to avoid opening a new window
 
-# --- PDF Extraction and Chunking Functions (Adapted from your first program) ---
-
-def extract_text_from_pdf(pdf_path):
-    """
-    Extracts text from a PDF file, page by page.
-    Includes error handling for file operations.
-    """
+# --- Text Extraction Functions for Each Format ---
+def extract_text_from_pdf(file_path, stop_event=None):
+    """Extracts text from a PDF file, returning a list of (page_number, text) tuples."""
     page_data = []
     try:
-        with open(pdf_path, 'rb') as file:
+        with open(file_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
-            for page_num in range(len(reader.pages)):
-                page = reader.pages[page_num]
-                # Check if page.extract_text() returns None or empty string
-                extracted_page_text = page.extract_text()
-                if extracted_page_text:
-                    page_data.append((page_num + 1, extracted_page_text))
-            return page_data
+            for page_num, page in enumerate(reader.pages):
+                if stop_event and stop_event.is_set(): return []
+                if extracted_text := page.extract_text():
+                    page_data.append((page_num + 1, extracted_text))
     except Exception as e:
-        # Print error to console and return empty string if extraction fails
-        print(f"Error extracting text from PDF: {e}")
+        print(f"Error reading PDF {file_path}: {e}")
+        # messagebox.showerror("PDF Error", f"Could not read the PDF file. It might be corrupted or encrypted.\n\nError: {e}")
+        # Error messages are now handled by the app class
+        raise e # Re-raise to be caught by the app's error handling
+    return page_data
+
+def extract_text_from_docx(file_path, stop_event=None):
+    """Extracts text from a DOCX file, returning it as a single page."""
+    try:
+        document = docx.Document(file_path)
+        full_text = "\n".join([para.text for para in document.paragraphs])
+        if stop_event and stop_event.is_set(): return []
+        return [(1, full_text)] if full_text else []
+    except Exception as e:
+        print(f"Error reading DOCX {file_path}: {e}")
+        # messagebox.showerror("DOCX Error", f"Could not read the DOCX file.\n\nError: {e}")
+        raise e # Re-raise to be caught by the app's error handling
+    return []
+
+def extract_text_from_txt(file_path, stop_event=None):
+    """Extracts text from a TXT file, returning it as a single page."""
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            full_text = f.read()
+            if stop_event and stop_event.is_set(): return []
+            return [(1, full_text)] if full_text else []
+    except Exception as e:
+        print(f"Error reading TXT {file_path}: {e}")
+        # messagebox.showerror("TXT Error", f"Could not read the TXT file.\n\nError: {e}")
+        raise e # Re-raise to be caught by the app's error handling
+    return []
+
+def extract_text_from_file(file_path, stop_event=None, app_instance=None):
+    """Dispatcher function to select the correct text extractor based on file extension."""
+    _, extension = os.path.splitext(file_path)
+    extension = extension.lower()
+    
+    # Map extensions to their extractor functions
+    extractor_map = {
+        '.pdf': extract_text_from_pdf,
+        '.docx': extract_text_from_docx,
+        '.txt': extract_text_from_txt,
+    }
+
+    if extractor := extractor_map.get(extension):
+        try:
+            return extractor(file_path, stop_event)
+        except NameError:
+             # This happens if a required library (e.g., 'docx') failed to import
+            if app_instance:
+                app_instance.show_error_message("Missing Dependency", app_instance.get_localized_text("missing_dependency").format(extension))
+            else:
+                messagebox.showerror("Missing Dependency", f"The library required for '{extension}' files is not installed. Please check the startup warnings.")
+            return []
+        except Exception as e:
+            # Catch specific errors from extractors and pass them to the app instance
+            error_key = None
+            if extension == '.pdf': error_key = "pdf_error"
+            elif extension == '.docx': error_key = "docx_error"
+            elif extension == '.txt': error_key = "txt_error"
+
+            if app_instance and error_key:
+                app_instance.show_error_message(app_instance.get_localized_text("processing_error_title"), app_instance.get_localized_text(error_key).format(e))
+            else:
+                messagebox.showerror("File Read Error", f"An error occurred while reading the file: {e}")
+            return []
+    else:
+        if app_instance:
+            app_instance.show_error_message(app_instance.get_localized_text("unsupported_format_title"), app_instance.get_localized_text("unsupported_format").format(extension))
+        else:
+            messagebox.showerror("Unsupported Format", f"File format '{extension}' is not supported.")
         return []
 
-def chunk_text(page_data, max_tokens=256, overlap_words=50):
-    """
-    Splits text from a list of (page_number, page_text) into smaller,
-    overlapping snippets, retaining the starting page number for each snippet.
-
-    Args:
-        page_data (list): A list of (page_number, page_text) tuples.
-        max_tokens (int): The maximum number of words allowed in a chunk.
-        overlap_words (int): The approximate number of words to overlap.
-
-    Returns:
-        list: A list of dictionaries, where each dict is
-              {'text': snippet_string, 'page': starting_page_number}.
-    """
+# --- Chunking and Semantic Search Functions ---
+def chunk_text(page_data, max_tokens=256, overlap_words=50, stop_event=None):
+    """Splits text into smaller, overlapping snippets."""
     chunks_with_pages = []
-    
-    current_chunk_sentences_info = [] # Stores (sentence, original_page_num)
+    current_chunk_sentences_info = []
     current_chunk_length = 0
-    first_page_in_chunk = -1 # To keep track of the first page of the current chunk
-
+    first_page_in_chunk = -1
     for page_num, page_text in page_data:
-        sentences = nltk.sent_tokenize(page_text)
+        if stop_event and stop_event.is_set(): return []
+        # --- MODIFIED: Use NLTK's Russian tokenizer if available, otherwise default ---
+        try:
+            sentences = nltk.sent_tokenize(page_text, language='russian')
+        except LookupError: # Fallback if Russian tokenizer isn't found for some reason
+            sentences = nltk.sent_tokenize(page_text)
+        
         for sentence in sentences:
             sentence_length = len(sentence.split())
-            
-            # If this is the first sentence of a new chunk, record its page
-            if not current_chunk_sentences_info:
-                first_page_in_chunk = page_num
-            
-            # Check if adding the next sentence exceeds max_tokens.
-            # If so, finalize the current chunk.
+            if not current_chunk_sentences_info: first_page_in_chunk = page_num
             if current_chunk_length + sentence_length > max_tokens and current_chunk_sentences_info:
-                # Add the finished chunk and its starting page
-                chunks_with_pages.append({
-                    'text': " ".join([s_info[0] for s_info in current_chunk_sentences_info]).strip(),
-                    'page': first_page_in_chunk
-                })
-                
-                # Prepare for overlap: select sentences from the end of the current chunk
-                # that roughly sum up to 'overlap_words'.
-                overlap_content_info = []
-                overlap_len = 0
+                chunks_with_pages.append({'text': " ".join([s_info[0] for s_info in current_chunk_sentences_info]).strip(), 'page': first_page_in_chunk})
+                overlap_content_info, overlap_len = [], 0
                 for s_info_idx in range(len(current_chunk_sentences_info) - 1, -1, -1):
                     s_text, s_page = current_chunk_sentences_info[s_info_idx]
                     s_len = len(s_text.split())
                     if overlap_len + s_len <= overlap_words:
-                        overlap_content_info.insert(0, (s_text, s_page))
-                        overlap_len += s_len
-                    else:
-                        break
-                
-                current_chunk_sentences_info = overlap_content_info
-                current_chunk_length = overlap_len
-                
-                # The first page of the new chunk (after overlap)
-                if overlap_content_info:
-                    first_page_in_chunk = overlap_content_info[0][1] # Get page of the very first sentence in overlap
-                else:
-                    first_page_in_chunk = page_num # Fallback if overlap is empty, start with current page
-
-            # Add the current sentence to the chunk
-            current_chunk_sentences_info.append((sentence, page_num))
-            current_chunk_length += sentence_length
-    
-    # Add the last chunk if any sentences remain
+                        overlap_content_info.insert(0, (s_text, s_page)); overlap_len += s_len
+                    else: break
+                current_chunk_sentences_info, current_chunk_length = overlap_content_info, overlap_len
+                if overlap_content_info: first_page_in_chunk = overlap_content_info[0][1]
+                else: first_page_in_chunk = page_num
+            current_chunk_sentences_info.append((sentence, page_num)); current_chunk_length += sentence_length
     if current_chunk_sentences_info:
-        chunks_with_pages.append({
-            'text': " ".join([s_info[0] for s_info in current_chunk_sentences_info]).strip(),
-            'page': first_page_in_chunk
-        })
-            
-    # Filter out empty or very short snippets
+        chunks_with_pages.append({'text': " ".join([s_info[0] for s_info in current_chunk_sentences_info]).strip(), 'page': first_page_in_chunk})
     return [chunk for chunk in chunks_with_pages if len(chunk['text']) > 20]
 
 def find_best_snippets(query, snippets_with_pages, snippet_embeddings, model, top_n=5):
-    """
-    Finds the top N snippets most relevant to the user's query using cosine similarity
-    between their embeddings.
-
-    Args:
-        query (str): The user's search query.
-        snippets (list): A list of text chunks (strings).
-        snippet_embeddings (numpy.ndarray): Embeddings for each snippet.
-        model (SentenceTransformer): The pre-loaded sentence embedding model.
-        top_n (int): The number of top relevant snippets to return.
-
-    Returns:
-        list: A list of the top N most relevant snippets.
-    """
-    if not snippets_with_pages or snippet_embeddings is None:
-        return [] # Return empty if no snippets or embeddings are available
-
-    # Encode the user query into a vector
+    """Finds the top N snippets most relevant to the user's query."""
+    if not snippets_with_pages or snippet_embeddings is None: return []
     query_embedding = model.encode([query])
-    
-    # Calculate cosine similarity between the query embedding and all snippet embeddings.
-    # cosine_similarity returns a 2D array, so we take the first row [0].
-    similarities = cosine_similarity(query_embedding, snippet_embeddings)[0]
-
-    # Get the indices of the top N most similar snippets.
-    # np.argsort returns indices that would sort an array; [::-1] reverses it for descending order.
-    # [:top_n] takes the first N indices (most similar).
-    top_n_indices = np.argsort(similarities)[::-1][:top_n]
-
-    # Return the actual snippets corresponding to the top N indices
+    sim_scores = cosine_similarity(query_embedding, snippet_embeddings)[0]
+    top_n_indices = np.argsort(sim_scores)[::-1][:top_n]
     return [snippets_with_pages[i] for i in top_n_indices]
 
-class PDFExtractorApp:
-    """
-    A desktop application that combines PDF text extraction, intelligent chunking,
-    and semantic search to find relevant content based on user queries.
-    It leverages SentenceTransformer for semantic understanding.
-    """
+
+# --- Main Application Class (Updated) ---
+class SemanticDocumentExtractorApp:
     def __init__(self, master):
-        """
-        Initializes the PDFExtractorApp with the main Tkinter window and sets up the GUI elements.
-
-        Args:
-            master (tk.Tk): The root Tkinter window.
-        """
         self.master = master
-        master.title("Semantic PDF Content Extractor")
-        master.geometry("1000x700") # Set an initial window size, larger for more content
+        
+        # --- Language Configuration ---
+        self.languages = {"English": "en", "Русский": "ru"}
+        self.current_language_var = tk.StringVar(master)
+        self.current_language_var.set("English") # Default language
+        self.current_language_var.trace_add("write", self.on_language_change)
 
-        # Configure grid layout for responsiveness
-        master.grid_rowconfigure(0, weight=0) # PDF selection controls
-        master.grid_rowconfigure(1, weight=0) # Request input controls
-        master.grid_rowconfigure(2, weight=0) # Action button
-        master.grid_rowconfigure(3, weight=1) # Result text area (expands vertically)
-        master.grid_columnconfigure(0, weight=1) # Left column expands
-        master.grid_columnconfigure(1, weight=1) # Right column expands
+        self.translations = {
+            "en": {
+                "app_title": "Semantic Document Content Extractor",
+                "select_doc_label": "Selected Document", # Changed for cleaner display
+                "select_doc_button": "Select Document",
+                "query_label": "Enter your semantic query:",
+                "find_button": "Find Relevant Content",
+                "cancel_button": "Cancel Processing",
+                "instructions_title": "Instructions:",
+                "instructions_step1": "1. Click 'Select Document' to choose a .pdf, .docx, or .txt file.",
+                "instructions_step2": "2. Wait for the processing and embedding to complete (this model supports English and Russian).",
+                "instructions_step3": "3. Enter a query (in English or Russian) and click 'Find Relevant Content'.",
+                "processing_doc": "Processing document...",
+                "extracting_text": "Extracting text from '{}'...",
+                "extraction_cancelled": "Extraction cancelled.",
+                "no_text_extracted": "No text could be extracted.",
+                "chunking_text": "Chunking text...",
+                "chunking_cancelled": "Chunking cancelled.",
+                "no_snippets": "No usable snippets were generated.",
+                "snippets_created": "Created {} snippets.",
+                "loading_embedding": "Loading and embedding snippets using model: {}...",
+                "model_loaded": "Model loaded for embedding.",
+                "model_load_error": "Failed to load SentenceTransformer model '{}': {}\n\nPlease check your internet connection and try again.",
+                "embedding_cancelled": "Embedding cancelled.",
+                "embedding_complete": "Embedding complete.",
+                "saving_data": "Saving data to cache...",
+                "data_saved": "Data saved.",
+                "loading_precomputed": "Loading pre-computed data for {} (using {})...",
+                "loaded_cache": "Loaded {} snippets and embeddings from cache.",
+                "busy_warning": "Processing is already in progress. Please wait or cancel.",
+                "processing_error_title": "Processing Error", # Added title key
+                "search_error_title": "Search Error", # Added title key
+                "select_doc_error": "Please select and process a document first.",
+                "enter_query_error": "Please enter a query.",
+                "model_not_loaded_error": "Semantic model not loaded. Please re-process the document.",
+                "top_snippets_title": "\n--- Top 5 Best Fitting Snippets ---\n",
+                "snippet_info": "\nSnippet {} (Page: {}):\n{}\n---",
+                "snippet_info_no_page": "\nSnippet {} (Page: N/A):\n{}\n---",
+                "no_snippets_found": "No relevant snippets found for your query.",
+                "missing_pypdf2": "PyPDF2 is not installed (for .pdf files).\nPlease use: pip install PyPDF2",
+                "missing_python_docx": "python-docx is not installed.\nProcessing .docx files will not be possible.\nPlease use: pip install python-docx",
+                "missing_ai_libs": "The 'sentence-transformers' or 'scikit-learn' libraries are not installed.\nPlease install them to enable semantic search.\n\nUse: pip install sentence-transformers scikit-learn",
+                "nltk_punkt_en": "Downloading 'punkt' tokenizer (English) for text processing. This is a one-time download.",
+                "nltk_punkt_ru": "Downloading 'punkt' tokenizer (Russian) for text processing. This is a one-time download.",
+                "pdf_error": "Could not read the PDF file. It might be corrupted or encrypted.\n\nError: {}",
+                "docx_error": "Could not read the DOCX file.\n\nError: {}",
+                "txt_error": "Could not read the TXT file.\n\nError: {}",
+                "unsupported_format_title": "Unsupported Format", # Added title key
+                "unsupported_format": "File format '{}' is not supported.",
+                "missing_dependency": "The library required for '{}' files is not installed. Please check the startup warnings.",
+                "choose_language": "Choosing language (Выбор языка)",
+                "supported_docs_filter": "Supported Documents",
+                "all_files_filter": "All files",
+                "finding_snippets": "Finding snippets for '{}'...",
+                "cancellation_requested": "Cancellation requested..."
+            },
+            "ru": {
+                "app_title": "Извлекатель Содержимого Документов",
+                "select_doc_label": "Выбранный Документ", # Changed for cleaner display
+                "select_doc_button": "Выбрать Документ",
+                "query_label": "Введите ваш семантический запрос:",
+                "find_button": "Найти Релевантное Содержимое",
+                "cancel_button": "Отменить Обработку",
+                "instructions_title": "Инструкции:",
+                "instructions_step1": "1. Нажмите 'Выбрать Документ', чтобы выбрать файл .pdf, .docx или .txt.",
+                "instructions_step2": "2. Дождитесь завершения обработки и встраивания (эта модель поддерживает английский и русский языки).",
+                "instructions_step3": "3. Введите запрос (на английском или русском) и нажмите 'Найти Релевантное Содержимое'.",
+                "processing_doc": "Обработка документа...",
+                "extracting_text": "Извлечение текста из '{}'...",
+                "extraction_cancelled": "Извлечение отменено.",
+                "no_text_extracted": "Текст не удалось извлечь.",
+                "chunking_text": "Разбивка текста на фрагменты...",
+                "chunking_cancelled": "Разбивка отменена.",
+                "no_snippets": "Не удалось сгенерировать пригодные фрагменты.",
+                "snippets_created": "Создано {} фрагментов.",
+                "loading_embedding": "Загрузка и встраивание фрагментов с использованием модели: {}...",
+                "model_loaded": "Модель загружена для встраивания.",
+                "model_load_error": "Не удалось загрузить модель SentenceTransformer '{}': {}\n\nПожалуйста, проверьте ваше интернет-соединение и попробуйте снова.",
+                "embedding_cancelled": "Встраивание отменено.",
+                "embedding_complete": "Встраивание завершено.",
+                "saving_data": "Сохранение данных в кэш...",
+                "data_saved": "Данные сохранены.",
+                "loading_precomputed": "Загрузка предварительно вычисленных данных для {} (используя {})...",
+                "loaded_cache": "Загружено {} фрагментов и встраиваний из кэша.",
+                "busy_warning": "Обработка уже выполняется. Пожалуйста, подождите или отмените.",
+                "processing_error_title": "Ошибка Обработки", # Added title key
+                "search_error_title": "Ошибка Поиска", # Added title key
+                "select_doc_error": "Пожалуйста, сначала выберите и обработайте документ.",
+                "enter_query_error": "Пожалуйста, введите запрос.",
+                "model_not_loaded_error": "Семантическая модель не загружена. Пожалуйста, повторно обработайте документ.",
+                "top_snippets_title": "\n--- Топ 5 наиболее подходящих фрагментов ---\n",
+                "snippet_info": "\nФрагмент {} (Страница: {}):\n{}\n---",
+                "snippet_info_no_page": "\nФрагмент {} (Страница: Н/Д):\n{}\n---",
+                "no_snippets_found": "Не найдено релевантных фрагментов для вашего запроса.",
+                "missing_pypdf2": "PyPDF2 не установлен (для файлов .pdf).\nПожалуйста, используйте: pip install PyPDF2",
+                "missing_python_docx": "python-docx не установлен.\nОбработка файлов .docx будет невозможна.\nПожалуйста, используйте: pip install python-docx",
+                "missing_ai_libs": "Библиотеки 'sentence-transformers' или 'scikit-learn' не установлены.\nПожалуйста, установите их, чтобы включить семантический поиск.\n\nИспользуйте: pip install sentence-transformers scikit-learn",
+                "nltk_punkt_en": "Загрузка токенизатора 'punkt' (английский) для обработки текста. Это одноразовая загрузка.",
+                "nltk_punkt_ru": "Загрузка токенизатора 'punkt' (русский) для обработки текста. Это одноразовая загрузка.",
+                "pdf_error": "Не удалось прочитать файл PDF. Возможно, он поврежден или зашифрован.\n\nОшибка: {}",
+                "docx_error": "Не удалось прочитать файл DOCX.\n\nОшибка: {}",
+                "txt_error": "Не удалось прочитать файл TXT.\n\nОшибка: {}",
+                "unsupported_format_title": "Неподдерживаемый Формат", # Added title key
+                "unsupported_format": "Формат файла '{}' не поддерживается.",
+                "missing_dependency": "Библиотека, необходимая для файлов '{}', не установлена. Пожалуйста, проверьте предупреждения при запуске.",
+                "choose_language": "Выбор языка (Choosing language)",
+                "supported_docs_filter": "Поддерживаемые Документы",
+                "all_files_filter": "Все файлы",
+                "finding_snippets": "Поиск фрагментов для '{}'...",
+                "cancellation_requested": "Запрос на отмену..."
+            }
+        }
+        self.current_lang_texts = self.translations[self.languages[self.current_language_var.get()]]
 
-        self.pdf_path = "" # Stores the path to the selected PDF file
-        self.snippets = [] # Stores extracted text chunks
-        self.snippet_embeddings = None # Stores embeddings of the snippets
-        self.model = None # Stores the SentenceTransformer model
+        master.geometry("1000x750")
 
-        # Inside PDFExtractorApp.__init__ or as a class variable
-        self.data_dir = "processed_data" # Or "cache"
-        os.makedirs(self.data_dir, exist_ok=True)
+        # Configure grid layout
+        master.grid_rowconfigure(4, weight=1); master.grid_columnconfigure(0, weight=1) # Adjusted row for new dropdown
 
-        # --- Initialize the SentenceTransformer model early ---
-        # This can take some time, so it's good to do it once at startup.
-        # Inform the user that the model is loading.
-        messagebox.showinfo("Loading Model", "Loading SentenceTransformer model (all-MiniLM-L6-v2). This may take a moment...")
-        try:
-            # Use 'cuda' if a GPU is available, otherwise defaults to CPU.
-            self.model = SentenceTransformer('all-MiniLM-L6-v2')
-            messagebox.showinfo("Model Loaded", "SentenceTransformer model loaded successfully!")
-        except Exception as e:
-            messagebox.showerror("Model Load Error", f"Failed to load SentenceTransformer model: {e}\n"
-                                                      "Please check your internet connection and ensure all necessary libraries are installed.")
-            # Disable functionality if model fails to load
-            self.extract_button.config(state=tk.DISABLED)
-            self.select_pdf_button.config(state=tk.DISABLED)
-            return
-
-        # --- PDF Selection Section ---
-        # Frame to group PDF selection elements for better organization
-        self.select_pdf_frame = tk.Frame(master)
-        self.select_pdf_frame.grid(row=0, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
-        self.select_pdf_frame.columnconfigure(0, weight=1) # Label column expands horizontally
-        self.select_pdf_frame.columnconfigure(1, weight=0) # Button column does not expand
-
-        # Label to display the path of the selected PDF file
-        self.pdf_path_label = tk.Label(
-            self.select_pdf_frame,
-            text="No PDF selected",
-            wraplength=700, # Wrap text if the path is too long to fit in one line
-            justify="left"
-        )
-        self.pdf_path_label.grid(row=0, column=0, padx=5, sticky="w")
-
-        # Button to open the file dialog for PDF selection
-        self.select_pdf_button = tk.Button(
-            self.select_pdf_frame,
-            text="Select PDF",
-            command=self.select_pdf_file
-        )
-        self.select_pdf_button.grid(row=0, column=1, padx=5, sticky="e")
-
-        # --- Request Input Section ---
-        # Frame to group user request input elements
-        self.request_frame = tk.Frame(master)
-        self.request_frame.grid(row=1, column=0, columnspan=2, pady=5, padx=10, sticky="ew")
-        self.request_frame.columnconfigure(0, weight=0) # Label column
-        self.request_frame.columnconfigure(1, weight=1) # Entry column expands
-
-        # Label for the request input field
-        self.request_label = tk.Label(self.request_frame, text="Enter your semantic query:")
-        self.request_label.grid(row=0, column=0, padx=5, sticky="w")
-
-        # Entry widget for the user to type their request
-        self.request_entry = tk.Entry(self.request_frame, width=80)
-        self.request_entry.grid(row=0, column=1, padx=5, sticky="ew")
-        # Bind the Enter key to the extract_content method for convenience
-        self.request_entry.bind("<Return>", lambda event=None: self.extract_content())
-
-
-        # --- Action Button Section ---
-        # Frame to group the action button
-        self.action_frame = tk.Frame(master)
-        self.action_frame.grid(row=2, column=0, columnspan=2, pady=10, padx=10)
-
-        # Button to trigger the content extraction process
-        self.extract_button = tk.Button(
-            self.action_frame,
-            text="Find Relevant Content",
-            command=self.extract_content
-        )
-        self.extract_button.pack(pady=5)
-
-        # --- Result Display Section ---
-        # ScrolledText widget to display the extracted content, with word wrapping
-        self.result_text = scrolledtext.ScrolledText(master, wrap=tk.WORD, width=100, height=25, font=("Arial", 10))
-        self.result_text.grid(row=3, column=0, columnspan=2, pady=10, padx=10, sticky="nsew")
-        self.result_text.insert(tk.END, "Instructions:\n"
-                                         "1. Click 'Select PDF' to choose your document.\n"
-                                         "2. Once selected, the app will process and embed the PDF's content (this might take a moment).\n"
-                                         "3. Enter a query (e.g., 'What are the principles of influence?') in the text box.\n"
-                                         "4. Click 'Find Relevant Content' or press Enter to see the top 5 most semantically similar passages.\n")
-
-    def select_pdf_file(self):
-        """
-        Opens a file dialog to allow the user to select a PDF file.
-        Updates the pdf_path_label and triggers the PDF processing (chunking and embedding).
-        """
-        file_path = filedialog.askopenfilename(
-            title="Select PDF File",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
-        )
-        if file_path:
-            self.pdf_path = file_path
-            self.pdf_path_label.config(text=f"Selected PDF: {os.path.basename(self.pdf_path)}")
-            self.result_text.delete(1.0, tk.END) # Clear any previous results
-            
-            # Initiate PDF processing (extraction, chunking, embedding)
-            self.process_pdf()
-
-    def process_pdf(self):
-        """
-        Handles the extraction, chunking, and embedding of the selected PDF.
-        It first checks for pre-computed files to save time.
-        """
-        if not self.pdf_path:
-            return
-
-        # In process_pdf:
-        pdf_base_name = os.path.splitext(os.path.basename(self.pdf_path))[0] # Get just the filename without path
-        snippets_filepath = os.path.join(self.data_dir, f"{pdf_base_name}_snippets.json")
-        embeddings_filepath = os.path.join(self.data_dir, f"{pdf_base_name}_embeddings.npy")
-
+        self.doc_path = ""
         self.snippets = []
         self.snippet_embeddings = None
-
-        self.result_text.delete(1.0, tk.END)
-        self.result_text.insert(tk.END, "Processing PDF... Please wait. This may take a while for large documents.\n")
-        self.master.update_idletasks() # Update GUI to show message
-
-        # Try to load pre-computed snippets and embeddings
-        if os.path.exists(snippets_filepath) and os.path.exists(embeddings_filepath):
-            try:
-                self.result_text.insert(tk.END, f"Loading pre-computed data from {os.path.basename(snippets_filepath)}...\n")
-                self.master.update_idletasks()
-                with open(snippets_filepath, 'r', encoding='utf-8') as f:
-                    self.snippets = json.load(f)
-                self.snippet_embeddings = np.load(embeddings_filepath)
-                self.result_text.insert(tk.END, f"Loaded {len(self.snippets)} snippets and their embeddings.\n")
-                messagebox.showinfo("PDF Processed", f"Loaded pre-computed data for '{os.path.basename(self.pdf_path)}'.")
-                return # Exit if successfully loaded
-            except Exception as e:
-                self.result_text.insert(tk.END, f"Error loading saved data: {e}. Re-processing PDF from scratch.\n")
-                self.snippets = [] # Reset to force re-processing
-                self.snippet_embeddings = None
+        # --- MODIFIED: Use a multilingual model for better Russian support ---
+        self.model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
         
-        # If not loaded, process the PDF from scratch
-        try:
-            self.result_text.insert(tk.END, f"Extracting text from '{os.path.basename(self.pdf_path)}'...\n")
-            self.master.update_idletasks()
-            page_data = extract_text_from_pdf(self.pdf_path)
-            if not page_data:
-                self.result_text.insert(tk.END, "Error: Could not extract text from PDF. Please check the file's content or if it's an image-only PDF.\n")
-                messagebox.showerror("Extraction Error", "Could not extract text from PDF. It might be an image-only PDF or corrupted.")
-                return
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.local_model_path = os.path.join(script_dir, 'models', self.model_name)
 
-            self.result_text.insert(tk.END, "Chunking text into snippets...\n")
-            self.master.update_idletasks()
-            self.snippets = chunk_text(page_data, max_tokens=256, overlap_words=50)
-            self.result_text.insert(tk.END, f"Created {len(self.snippets)} snippets.\n")
+        self.model = None # Model will be loaded lazily
+        self.data_dir = "processed_data"
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.processing_thread = None
+        self.stop_event = threading.Event()
 
-            if not self.snippets:
-                self.result_text.insert(tk.END, "Error: No snippets were generated from the PDF text. Text might be too short or chunking parameters too restrictive.\n")
-                messagebox.showerror("Chunking Error", "No usable snippets generated. PDF content might be too sparse.")
-                return
+        # --- GUI Elements ---
+        self.setup_ui()
+        self.display_initial_instructions() # Display instructions only once at startup
+        self.set_ui_state(during_processing=False) # Set initial state
+
+    def get_localized_text(self, key):
+        """Retrieves the localized text for a given key."""
+        return self.current_lang_texts.get(key, key) # Fallback to key if not found
+
+    def on_language_change(self, *args):
+        """Callback function when the language dropdown selection changes."""
+        selected_lang_name = self.current_language_var.get()
+        lang_code = self.languages.get(selected_lang_name, "en") # Default to English if not found
+        self.current_lang_texts = self.translations[lang_code]
+        self.update_ui_texts()
+        self.master.title(self.get_localized_text("app_title"))
+
+    def update_ui_texts(self):
+        """Updates all UI elements with the currently selected language."""
+        self.master.title(self.get_localized_text("app_title"))
+        # Update doc_path_label based on whether a document is selected
+        if self.doc_path:
+            self.doc_path_label.config(text=f"{self.get_localized_text('select_doc_label')}: {os.path.basename(self.doc_path)}")
+        else:
+            self.doc_path_label.config(text=self.get_localized_text("select_doc_label"))
             
-            self.result_text.insert(tk.END, "Embedding snippets (this is CPU/GPU intensive)...\n")
-            self.master.update_idletasks()
-            # The model automatically handles batching for speed
-            snippet_texts_for_embedding = [s['text'] for s in self.snippets] 
-            self.snippet_embeddings = self.model.encode(self.snippets, show_progress_bar=True, convert_to_numpy=True)
-            self.result_text.insert(tk.END, "Embedding complete.\n")
+        self.select_doc_button.config(text=self.get_localized_text("select_doc_button"))
+        self.query_label.config(text=self.get_localized_text("query_label"))
+        self.extract_button.config(text=self.get_localized_text("find_button"))
+        self.cancel_button.config(text=self.get_localized_text("cancel_button"))
+        
+        # NOTE: The result_text (log area) is NOT cleared or re-populated with instructions here.
+        # New messages will be in the new language, old ones remain as they were.
 
-            # Save snippets and their embeddings for future use
-            self.result_text.insert(tk.END, "Saving processed data...\n")
-            self.master.update_idletasks()
-            with open(snippets_filepath, 'w', encoding='utf-8') as f:
-                json.dump(self.snippets, f, ensure_ascii=False, indent=4)
-            np.save(embeddings_filepath, self.snippet_embeddings)
-            self.result_text.insert(tk.END, "Snippets and embeddings saved successfully.\n")
-            messagebox.showinfo("PDF Processed", f"'{os.path.basename(self.pdf_path)}' processed and data saved for quick access.")
+    def setup_ui(self):
+        """Creates and places all GUI widgets."""
+        # Define a consistent font size for the application
+        # You can adjust this value to your preference
+        self.default_font_size = 12
+        self.large_font = font.Font(family="Arial", size=self.default_font_size)
+        self.bold_font = font.Font(family="Arial", size=self.default_font_size, weight="bold")
 
-        except PyPDF2.errors.PdfReadError:
-            self.result_text.insert(tk.END, "Error: Invalid PDF file or corrupted. Cannot read this PDF.\n")
-            messagebox.showerror("PDF Error", "Invalid or corrupted PDF file.")
-        except FileNotFoundError:
-            self.result_text.insert(tk.END, f"Error: The file '{self.pdf_path}' was not found. Please make sure the PDF is in the correct directory.\n")
-            messagebox.showerror("File Error", "PDF file not found.")
+        # --- Language Dropdown ---
+        lang_frame = tk.Frame(self.master)
+        lang_frame.grid(row=0, column=0, columnspan=2, pady=5, padx=10, sticky="ew")
+        lang_frame.columnconfigure(1, weight=1)
+
+        tk.Label(lang_frame, text=self.get_localized_text("choose_language"), font=self.large_font).grid(row=0, column=0, padx=5, sticky="w")
+        self.language_dropdown = ttk.Combobox(lang_frame, textvariable=self.current_language_var,
+                                              values=list(self.languages.keys()), state="readonly", font=self.large_font)
+        self.language_dropdown.grid(row=0, column=1, padx=5, sticky="ew")
+
+
+        # --- Document Selection ---
+        select_frame = tk.Frame(self.master)
+        select_frame.grid(row=1, column=0, columnspan=2, pady=10, padx=10, sticky="ew")
+        select_frame.columnconfigure(0, weight=1)
+        
+        self.doc_path_label = tk.Label(select_frame, text="", wraplength=700, justify="left", font=self.large_font)
+        self.doc_path_label.grid(row=0, column=0, padx=5, sticky="w")
+        
+        self.select_doc_button = tk.Button(select_frame, text="", command=self.select_document_file, font=self.large_font)
+        self.select_doc_button.grid(row=0, column=1, padx=5, sticky="e")
+
+        # --- Query Input ---
+        request_frame = tk.Frame(self.master)
+        request_frame.grid(row=2, column=0, columnspan=2, pady=5, padx=10, sticky="ew")
+        request_frame.columnconfigure(1, weight=1)
+        
+        self.query_label = tk.Label(request_frame, text="", font=self.large_font)
+        self.query_label.grid(row=0, column=0, padx=5, sticky="w")
+        self.request_entry = tk.Entry(request_frame, width=80, state=tk.DISABLED, font=self.large_font)
+        self.request_entry.grid(row=0, column=1, padx=5, sticky="ew")
+        self.request_entry.bind("<Return>", lambda e: self.extract_content())
+
+        # --- Actions and Progress Bar ---
+        action_frame = tk.Frame(self.master)
+        action_frame.grid(row=3, column=0, columnspan=2, pady=10, padx=10)
+        
+        buttons_sub_frame = tk.Frame(action_frame)
+        buttons_sub_frame.pack(pady=(0, 5))
+        
+        self.extract_button = tk.Button(buttons_sub_frame, text="", command=self.extract_content, state=tk.DISABLED, font=self.large_font)
+        self.extract_button.grid(row=0, column=0, padx=5)
+        
+        self.cancel_button = tk.Button(buttons_sub_frame, text="", command=self.cancel_processing, state=tk.DISABLED, font=self.large_font)
+        self.cancel_button.grid(row=0, column=1, padx=5)
+        
+        self.progress_bar = ttk.Progressbar(action_frame, orient='horizontal', mode='determinate', length=400)
+        self.progress_bar.pack()
+
+        # --- Results Display ---
+        self.result_text = scrolledtext.ScrolledText(self.master, wrap=tk.WORD, width=100, height=25, font=("Arial", self.default_font_size + 2)) # Slightly larger for readability
+        self.result_text.grid(row=4, column=0, columnspan=2, pady=10, padx=10, sticky="nsew")
+        
+        # Initialize UI texts with default language
+        self.update_ui_texts()
+
+    def display_initial_instructions(self):
+        """Displays the initial instructions in the result text area."""
+        self.result_text.insert(tk.END, f"{self.get_localized_text('instructions_title')}\n")
+        self.result_text.insert(tk.END, f"{self.get_localized_text('instructions_step1')}\n")
+        self.result_text.insert(tk.END, f"{self.get_localized_text('instructions_step2')}\n")
+        self.result_text.insert(tk.END, f"{self.get_localized_text('instructions_step3')}\n")
+        self.result_text.see(tk.END) # Scroll to the end
+
+    def show_error_message(self, title_key, message_key):
+        """Helper to show localized error messages."""
+        messagebox.showerror(self.get_localized_text(title_key), message_key)
+
+    def show_warning_message(self, title_key, message_key):
+        """Helper to show localized warning messages."""
+        messagebox.showwarning(self.get_localized_text(title_key), message_key)
+
+    def show_info_message(self, title_key, message_key):
+        """Helper to show localized info messages."""
+        messagebox.showinfo(self.get_localized_text(title_key), message_key)
+
+    def update_status(self, message):
+        self.result_text.insert(tk.END, message + "\n"); self.result_text.see(tk.END); self.master.update_idletasks()
+
+    def update_progress_bar(self, value):
+        self.progress_bar['value'] = value; self.master.update_idletasks()
+
+    def set_ui_state(self, during_processing=False):
+        # Select document button is always enabled to allow starting new processing
+        self.select_doc_button.config(state=tk.NORMAL) 
+        
+        # Query and extract button enabled only if snippets are loaded and not processing
+        can_query = not during_processing and self.snippets and self.snippet_embeddings is not None
+        self.extract_button.config(state=tk.NORMAL if can_query else tk.DISABLED)
+        self.request_entry.config(state=tk.NORMAL if can_query else tk.DISABLED)
+        
+        # Cancel button enabled only during processing
+        self.cancel_button.config(state=tk.NORMAL if during_processing else tk.DISABLED)
+
+    def select_document_file(self):
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.show_warning_message("Busy", self.get_localized_text("busy_warning"))
+            return
+        file_path = filedialog.askopenfilename(
+            title=self.get_localized_text("select_doc_button"), # Use localized title
+            filetypes=[
+                (self.get_localized_text("supported_docs_filter"), "*.pdf *.docx *.txt"), # Add localized filter name
+                ("PDF files", "*.pdf"),
+                ("Word Documents", "*.docx"),
+                ("Text files", "*.txt"),
+                (self.get_localized_text("all_files_filter"), "*.*") # Add localized filter name
+            ]
+        )
+        if file_path:
+            self.doc_path = file_path
+            self.doc_path_label.config(text=f"{self.get_localized_text('select_doc_label')}: {os.path.basename(self.doc_path)}")
+            # No clearing of result_text here, only update path label
+            self.progress_bar['value'] = 0
+            self.stop_event.clear()
+            self.set_ui_state(during_processing=True)
+            self.processing_thread = threading.Thread(target=self.process_document_threaded)
+            self.processing_thread.start()
+
+    def process_document_threaded(self):
+        """Processes the selected document in a background thread."""
+        try:
+            # Generate a unique identifier for the document based on its full path
+            unique_doc_id = hashlib.md5(self.doc_path.encode('utf-8')).hexdigest()
+            
+            self.snippets, self.snippet_embeddings = [], None
+            self.master.after(0, self.update_progress_bar, 0)
+            self.master.after(0, self.update_status, self.get_localized_text("processing_doc"))
+
+            # Check cache first
+            # --- MODIFIED: Include model name in cache check to avoid using old embeddings with new model ---
+            model_specific_snippets_filepath = os.path.join(self.data_dir, f"{unique_doc_id}_{self.model_name.replace('/', '_')}_snippets.json")
+            model_specific_embeddings_filepath = os.path.join(self.data_dir, f"{unique_doc_id}_{self.model_name.replace('/', '_')}_embeddings.npy")
+
+            if os.path.exists(model_specific_snippets_filepath) and os.path.exists(model_specific_embeddings_filepath):
+                self.master.after(0, self.update_status, self.get_localized_text("loading_precomputed").format(os.path.basename(self.doc_path), self.model_name))
+                with open(model_specific_snippets_filepath, 'r', encoding='utf-8') as f: self.snippets = json.load(f)
+                self.snippet_embeddings = np.load(model_specific_embeddings_filepath)
+                self.master.after(0, self.update_status, self.get_localized_text("loaded_cache").format(len(self.snippets)))
+                # Ensure model is loaded if not already (e.g., if app just started and cache was hit)
+                #if self.model is None:
+                    # No message box here, just load it silently
+                    #self.model = SentenceTransformer(self.model_name)
+                return
+
+            # If not in cache, process from scratch
+            self.master.after(0, self.update_status, self.get_localized_text("extracting_text").format(os.path.basename(self.doc_path)))
+            page_data = extract_text_from_file(self.doc_path, self.stop_event, self) # Pass app instance for error handling
+            if self.stop_event.is_set(): self.master.after(0, self.update_status, self.get_localized_text("extraction_cancelled")); return
+            if not page_data: self.master.after(0, self.update_status, self.get_localized_text("no_text_extracted")); return
+
+            self.master.after(0, self.update_status, self.get_localized_text("chunking_text"))
+            self.snippets = chunk_text(page_data, stop_event=self.stop_event)
+            if self.stop_event.is_set(): self.master.after(0, self.update_status, self.get_localized_text("chunking_cancelled")); return
+            if not self.snippets: self.master.after(0, self.update_status, self.get_localized_text("no_snippets")); return
+            self.master.after(0, self.update_status, self.get_localized_text("snippets_created").format(len(self.snippets)))
+
+            self.master.after(0, self.update_status, self.get_localized_text("loading_embedding").format(self.model_name))
+            # Lazy load the model here if it hasn't been loaded yet
+            if self.model is None:
+                try:
+                    self.model = SentenceTransformer(self.local_model_path)
+                    self.master.after(0, self.update_status, self.get_localized_text("model_loaded"))
+                except Exception as e:
+                    self.master.after(0, lambda: self.show_error_message("Model Load Error", self.get_localized_text("model_load_error").format(self.model_name, e)))
+                    return # Exit if model fails to load
+
+            snippet_texts = [s['text'] for s in self.snippets]
+            encoded_embeddings = []
+            for i, text in enumerate(snippet_texts):
+                if self.stop_event.is_set(): self.master.after(0, self.update_status, self.get_localized_text("embedding_cancelled")); return
+                encoded_embeddings.append(self.model.encode(text))
+                self.master.after(0, self.update_progress_bar, (i + 1) * 100 / len(snippet_texts))
+            self.snippet_embeddings = np.array(encoded_embeddings)
+            self.master.after(0, self.update_status, self.get_localized_text("embedding_complete"))
+
+            self.master.after(0, self.update_status, self.get_localized_text("saving_data"))
+            # --- MODIFIED: Save to model-specific cache files ---
+            with open(model_specific_snippets_filepath, 'w', encoding='utf-8') as f: json.dump(self.snippets, f, ensure_ascii=False, indent=4)
+            np.save(model_specific_embeddings_filepath, self.snippet_embeddings)
+            self.master.after(0, self.update_status, self.get_localized_text("data_saved"))
         except Exception as e:
-            self.result_text.insert(tk.END, f"An unexpected error occurred during PDF processing: {e}\n")
-            messagebox.showerror("Processing Error", f"An unexpected error occurred: {e}")
+            self.master.after(0, lambda: self.show_error_message(self.get_localized_text("processing_error_title"), self.get_localized_text("processing_error").format(e)))
+        finally:
+            self.master.after(0, self.set_ui_state, False)
+            self.master.after(0, self.update_progress_bar, 0)
+
+    def cancel_processing(self):
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.stop_event.set()
+            self.update_status(self.get_localized_text("cancellation_requested"))
+        else:
+            self.set_ui_state(False)
 
     def extract_content(self):
-        """
-        Performs the semantic search based on the user's query and displays the results.
-        This method is called when the 'Find Relevant Content' button is clicked or Enter is pressed.
-        """
-        if not self.pdf_path or self.snippet_embeddings is None or not self.snippets:
-            messagebox.showerror("Error", "Please select and process a PDF file first.")
-            return
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.show_warning_message("Busy", self.get_localized_text("busy_warning")); return
+        if self.snippet_embeddings is None: # Corrected check
+            self.show_error_message("Error", self.get_localized_text("select_doc_error")); return
+        if not (request := self.request_entry.get().strip()):
+            self.show_error_message("Error", self.get_localized_text("enter_query_error")); return
 
-        request = self.request_entry.get().strip()
-        if not request:
-            messagebox.showerror("Error", "Please enter a semantic query.")
-            return
-
-        self.result_text.delete(1.0, tk.END) # Clear previous results
-        self.result_text.insert(tk.END, f"Finding top 5 snippets for '{request}'...\n")
-        self.master.update_idletasks() # Update GUI immediately
-
+        self.result_text.delete(1.0, tk.END) # Clear previous search results
+        self.update_status(self.get_localized_text("finding_snippets").format(request))
         try:
-            # Call the semantic search function
-            best_fitting_snippets = find_best_snippets(request, self.snippets, self.snippet_embeddings, self.model, top_n=5)
+            # Ensure model is loaded before searching
+            if self.model is None:
+                self.show_error_message("Error", self.get_localized_text("model_not_loaded_error"))
+                return
 
-            if best_fitting_snippets:
-                self.result_text.insert(tk.END, "\n--- Top 5 Best Fitting Snippets ---\n")
-                for i, snippet_data in enumerate(best_fitting_snippets):
-                    self.result_text.insert(tk.END, f"Snippet {i+1} (Page: {snippet_data['page']}):\n{snippet_data['text']}\n---\n")
-                messagebox.showinfo("Search Complete", "Relevant snippets found!")
+            best_snippets = find_best_snippets(request, self.snippets, self.snippet_embeddings, self.model, top_n=5)
+            if best_snippets:
+                self.result_text.insert(tk.END, self.get_localized_text("top_snippets_title"))
+                for i, snippet_data in enumerate(best_snippets):
+                    page_info = snippet_data['page'] if snippet_data['page'] else "N/A"
+                    if snippet_data['page']:
+                        self.result_text.insert(tk.END, self.get_localized_text("snippet_info").format(i+1, page_info, snippet_data['text']))
+                    else:
+                        self.result_text.insert(tk.END, self.get_localized_text("snippet_info_no_page").format(i+1, snippet_data['text']))
             else:
-                self.result_text.insert(tk.END, "No relevant snippets found for your query. Try a different query or check the PDF content.\n")
-                messagebox.showinfo("No Results", "No relevant snippets found.")
-
+                self.result_text.insert(tk.END, self.get_localized_text("no_snippets_found"))
         except Exception as e:
-            self.result_text.insert(tk.END, f"An error occurred during search: {e}\n")
-            messagebox.showerror("Search Error", f"An error occurred during semantic search: {e}")
+            self.show_error_message(self.get_localized_text("search_error_title"), self.get_localized_text("search_error").format(e))
 
-# This block ensures the application runs only when the script is executed directly.
 if __name__ == "__main__":
-    root = tk.Tk() # Create the main Tkinter window
-    app = PDFExtractorApp(root) # Instantiate the application
-    root.mainloop() # Start the Tkinter event loop, which keeps the window open
+    root = tk.Tk()
+    app = SemanticDocumentExtractorApp(root)
+    root.mainloop()

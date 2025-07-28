@@ -1,0 +1,19 @@
+# Python bytecode
+__pycache__/
+
+# Virtual environment
+venv/
+.venv/
+
+# PyInstaller build directories
+build/
+dist/
+*.spec
+
+# Other temporary files
+*.log
+*.tmp
+/models
+/nltk_data
+/processed_data
+Application.spec
