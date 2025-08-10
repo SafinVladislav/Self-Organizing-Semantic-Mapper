@@ -15,6 +15,8 @@ import nltk
 def resolve_path(relative_path):
     """
     Returns the absolute path to a resource, handling PyInstaller's temporary folder.
+    This function is now primarily for NLTK data and other bundled resources,
+    as the transformer model will be downloaded separately.
     """
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
@@ -50,15 +52,20 @@ class SemanticExtractorLogic:
         self.model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
         self.model = None
 
-        # New code for a cross-platform solution
+        # New code for a cross-platform solution to find the user data directory
         user_data_path = None
         if sys.platform == "win32":
+            # On Windows, use LOCALAPPDATA
             user_data_path = os.path.join(os.getenv('LOCALAPPDATA'), 'SemanticExtractor')
         else: # macOS and Linux
+            # On other systems, use a hidden folder in the user's home directory
             user_data_path = os.path.join(os.path.expanduser('~'), '.semantic_extractor')
 
         self.data_dir = user_data_path
         os.makedirs(self.data_dir, exist_ok=True)
+
+        # The model will be downloaded to this specific directory.
+        self.model_local_path = os.path.join(self.data_dir, self.model_name.replace('/', '_'))
         
         # Callbacks to communicate with the UI
         self.status_callback = status_callback
@@ -75,15 +82,25 @@ class SemanticExtractorLogic:
             self.progress_callback(value)
 
     def _load_model(self):
-        """Loads the sentence transformer model if it's not already loaded."""
+        """
+        Loads the sentence transformer model. If it doesn't exist locally,
+        it downloads it to the user's data directory.
+        """
         if self.model is None:
             try:
-                ###
-                self._update_status("loading_embedding", self.model_name)
-                model_path = resolve_path('transformer_model')
+                # Check if the model is already downloaded
+                if os.path.exists(self.model_local_path) and os.listdir(self.model_local_path):
+                    self._update_status("loading_embedding", self.model_name)
+                    self.model = sentence_transformers.SentenceTransformer(self.model_local_path)
+                    self._update_status("model_loaded")
+                else:
+                    self._update_status("downloading_model", self.model_name)
+                    # Download the model and save it to the local path
+                    self.model = sentence_transformers.SentenceTransformer(self.model_name)
+                    self.model.save(self.model_local_path)
+                    self._update_status("model_downloaded")
+                    self._update_status("model_loaded")
 
-                self.model = sentence_transformers.SentenceTransformer(model_path)
-                self._update_status("model_loaded")
             except Exception as e:
                 self._update_status("model_load_error", self.model_name, e)
                 raise  # Re-raise the exception to be caught by the calling thread
@@ -322,8 +339,9 @@ class SemanticExtractorUI:
                 "extraction_cancelled": "Extraction cancelled.", "no_text_extracted": "No text could be extracted.",
                 "chunking_text": "Chunking text...", "chunking_cancelled": "Chunking cancelled.",
                 "no_snippets": "No usable snippets were generated.", "snippets_created": "Created {} snippets.",
-                "loading_embedding": "Loading and embedding snippets using model: {}...", "model_loaded": "Model loaded for embedding.",
-                "model_load_error": "Failed to load SentenceTransformer model '{}': {}\n\nPlease check your internet connection and try again.",
+                "loading_embedding": "Loading embedding model: {}...", "model_loaded": "Model loaded for embedding.",
+                "downloading_model": "Model not found locally. Downloading model: {}...", "model_downloaded": "Model downloaded successfully.",
+                "model_load_error": "Failed to load/download SentenceTransformer model '{}': {}\n\nPlease check your internet connection and try again.",
                 "embedding_cancelled": "Embedding cancelled.", "embedding_complete": "Embedding complete.",
                 "saving_data": "Saving data to cache...", "data_saved": "Data saved.",
                 "loading_precomputed": "Loading pre-computed data for {} (using {})...",
@@ -355,8 +373,9 @@ class SemanticExtractorUI:
                 "extraction_cancelled": "Извлечение отменено.", "no_text_extracted": "Текст не удалось извлечь.",
                 "chunking_text": "Разбивка текста на фрагменты...", "chunking_cancelled": "Разбивка отменена.",
                 "no_snippets": "Не удалось сгенерировать пригодные фрагменты.", "snippets_created": "Создано {} фрагментов.",
-                "loading_embedding": "Загрузка и встраивание фрагментов с использованием модели: {}...", "model_loaded": "Модель загружена для встраивания.",
-                "model_load_error": "Не удалось загрузить модель SentenceTransformer '{}': {}\n\nПожалуйста, проверьте ваше интернет-соединение и попробуйте снова.",
+                "loading_embedding": "Загрузка модели встраивания: {}...", "model_loaded": "Модель загружена для встраивания.",
+                "downloading_model": "Модель не найдена локально. Загрузка модели: {}...", "model_downloaded": "Модель успешно загружена.",
+                "model_load_error": "Не удалось загрузить/скачать модель SentenceTransformer '{}': {}\n\nПожалуйста, проверьте ваше интернет-соединение и попробуйте снова.",
                 "embedding_cancelled": "Встраивание отменено.", "embedding_complete": "Встраивание завершено.",
                 "saving_data": "Сохранение данных в кэш...", "data_saved": "Данные сохранены.",
                 "loading_precomputed": "Загрузка предварительно вычисленных данных для {} (используя {})...",
